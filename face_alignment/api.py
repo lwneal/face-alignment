@@ -106,6 +106,7 @@ class FaceAlignment:
         """
         return self.get_landmarks_from_image(image_or_path, detected_faces)
 
+    @torch.no_grad()
     def get_landmarks_from_image(self, image_or_path, detected_faces=None):
         """Predict the landmarks for each face present in the image.
 
@@ -129,8 +130,7 @@ class FaceAlignment:
             image = image_or_path.detach().cpu().numpy()
         else:
             image = image_or_path
-            
-            
+
         if image.ndim == 2:
             image = color.gray2rgb(image)
         elif image.ndim == 4:
@@ -143,7 +143,6 @@ class FaceAlignment:
             print("Warning: No faces were detected.")
             return None
 
-        torch.set_grad_enabled(False)
         landmarks = []
         for i, d in enumerate(detected_faces):
             center = torch.FloatTensor(
@@ -184,6 +183,80 @@ class FaceAlignment:
 
             landmarks.append(pts_img.numpy())
 
+        return landmarks
+
+    @torch.no_grad()
+    def get_landmarks_from_batch(self, image_batch, detected_faces=None):
+        """Predict the landmarks for each face present in the image.
+
+        This function predicts a set of 68 2D or 3D images, one for each image in a batch in parallel.
+        If detect_faces is None the method will also run a face detector.
+
+         Arguments:
+            image_batch {torch.tensor} -- The input images batch
+
+        Keyword Arguments:
+            detected_faces {list of numpy.array} -- list of bounding boxes, one for each face found
+            in the image (default: {None})
+        """
+
+        if detected_faces is None:
+            detected_faces = self.face_detector.detect_from_batch(image_batch)
+
+        if len(detected_faces) == 0:
+            print("Warning: No faces were detected.")
+            return None
+
+        landmarks = []
+        # A batch for each frame
+        for i, faces in enumerate(detected_faces):
+            landmark_set = []
+            for face in faces:
+                center = torch.FloatTensor(
+                    [(face[2] + face[0]) / 2.0,
+                     (face[3] + face[1]) / 2.0])
+
+                center[1] = center[1] - (face[3] - face[1]) * 0.12
+                scale = (face[2] - face[0] + face[3] - face[1]) / self.face_detector.reference_scale
+                image = image_batch[i].cpu().numpy()
+
+                image = image.transpose(1, 2, 0)
+
+                inp = crop(image, center, scale)
+                inp = torch.from_numpy(inp.transpose((2, 0, 1))).float()
+
+                inp = inp.to(self.device)
+                inp.div_(255.0).unsqueeze_(0)
+
+                out = self.face_alignment_net(inp)[-1].detach()
+                if self.flip_input:
+                    out += flip(self.face_alignment_net(flip(inp))
+                                [-1].detach(), is_label=True)  # patched inp_batch undefined variable error
+                out = out.cpu()
+                pts, pts_img = get_preds_fromhm(out, center, scale)
+
+                # Added 3D landmark support
+                if self.landmarks_type == LandmarksType._3D:
+                    pts, pts_img = pts.view(68, 2) * 4, pts_img.view(68, 2)
+                    heatmaps = np.zeros((68, 256, 256), dtype=np.float32)
+                    for i in range(68):
+                        if pts[i, 0] > 0:
+                            heatmaps[i] = draw_gaussian(
+                                heatmaps[i], pts[i], 2)
+                    heatmaps = torch.from_numpy(
+                        heatmaps).unsqueeze_(0)
+
+                    heatmaps = heatmaps.to(self.device)
+                    depth_pred = self.depth_prediciton_net(
+                        torch.cat((inp, heatmaps), 1)).data.cpu().view(68, 1)
+                    pts_img = torch.cat(
+                        (pts_img, depth_pred * (1.0 / (256.0 / (200.0 * scale)))), 1)
+                else:
+                    pts, pts_img = pts.view(-1, 68, 2) * 4, pts_img.view(-1, 68, 2)
+                landmark_set.append(pts_img.numpy())
+
+            landmark_set = np.concatenate(landmark_set, axis=0)
+            landmarks.append(landmark_set)
         return landmarks
 
     def get_landmarks_from_directory(self, path, extensions=['.jpg', '.png'], recursive=True, show_progress_bar=True):
